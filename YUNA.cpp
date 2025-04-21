@@ -89,6 +89,21 @@ public:
         }
     }
 
+    void displayBanner(){
+        std::cout << R"(
+            ██╗   ██╗██╗   ██╗███╗   ██╗ █████╗ 
+            ╚██╗ ██╔╝██║   ██║████╗  ██║██╔══██╗
+             ╚████╔╝ ██║   ██║██╔██╗ ██║███████║
+              ╚██╔╝  ██║   ██║██║╚██╗██║██╔══██║
+               ██║   ╚██████╔╝██║ ╚████║██║  ██║
+               ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝
+                                                
+                YUNA Firewall Management System
+                Version 1.0 -Developed by MALCOM 
+                (C) 2025 - All Rights Reserved
+                )" << std::endl;
+    }
+
     // Forward propagation function
     void forwardPropagate(const std::vector<double>& inputs) {
         // Compute hidden layer values
@@ -173,6 +188,14 @@ struct NetworkTrafficData {
     qint64 bytesTransferred;
 };
 
+struct FirewallRule {
+    QString action;
+    QString direction;
+    QString source;
+    QString destination;
+    QString protocol;
+};
+
 // Forward declaration of FirewallManager class
 class FirewallManager : public QObject {
     Q_OBJECT
@@ -185,12 +208,13 @@ private:
     QNetworkAccessManager *networkManager;
     bool panicModeEnabled = false;
     QMap<QString, ConnectionState> connectionTable;
+    bool internetStatus = false; // Track internet connectivity status
 
 public:
     explicit FirewallManager(QObject *parent = nullptr);
     explicit FirewallManager(QDBusConnection &bus, QObject *parent = nullptr);
     ~FirewallManager();
-
+    
     void initializeNeuralNetwork();
     NetworkFeatures extractFeatures(const ConnectionState& connection);
     std::vector<double> convertToVector(const NetworkFeatures& features);
@@ -234,7 +258,8 @@ public:
     void removePort(const QString &port, const QString &protocol);
     QMap<QString, int> analyzeTraffic();
     bool loadConfig();
-    
+    bool isInternetConnected(); // Added method
+
 private slots:
     void onGeoLocationReceived();
 
@@ -421,13 +446,16 @@ public:
                 int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
                 if (statusCode == 200) {
                     logInfo("Internet is available.");
+                    internetStatus = true;
                     emit internetStatusChanged(true);
                 } else {
                     logError("Unexpected HTTP status code: " + QString::number(statusCode));
+                    internetStatus = false;
                     emit internetStatusChanged(false);
                 }
             } else {
                 logError("Internet is not available: " + reply->errorString());
+                internetStatus = false;
                 emit internetStatusChanged(false);
             }
 
@@ -578,27 +606,328 @@ public:
         }
     }
 
+    void blockIPAddress(const QString &ipAddress) {
+        qDebug() << "Blocking IP address: " << ipAddress;
+        
+        // First try to block via DBus if interface is available
+        if (firewallInterface && firewallInterface->isValid()) {
+            QDBusMessage reply = firewallInterface->call("blockIP", ipAddress);
+            if (reply.type() == QDBusMessage::ReplyMessage) {
+                qDebug() << "IP address blocked successfully via firewalld:" << ipAddress;
+                logInfo("Blocked IP address: " + ipAddress);
+                return;
+            }
+        }
+        
+        // Fallback to local file-based blocking
+        QFile file(QDir::homePath() + "/FirewallManagerLogs/blocked_ips.json");
+        QDir dir(QFileInfo(file).absolutePath());
+        if (!dir.exists()) {
+            dir.mkpath(".");
+        }
+        
+        QJsonObject obj;
+        QJsonArray blockedArray;
+        
+        if (file.exists() && file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            // Read the existing JSON data from the file
+            QByteArray fileData = file.readAll();
+            QJsonDocument doc = QJsonDocument::fromJson(fileData);
+            file.close();
+            
+            if (doc.isObject()) {
+                obj = doc.object();
+                blockedArray = obj["blocked_ips"].toArray();
+            }
+        }
+        
+        // Check if the IP address is already blocked
+        if (blockedArray.contains(ipAddress)) {
+            qDebug() << "IP address is already blocked: " << ipAddress;
+            return;  // IP is already blocked, no need to add it again
+        }
+        
+        // Append the new IP address to the blocked list
+        blockedArray.append(ipAddress);
+        obj["blocked_ips"] = blockedArray;
+        
+        // Write the updated data back to the file
+        if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            file.write(QJsonDocument(obj).toJson());
+            file.close();
+            qDebug() << "Blocked IP: " << ipAddress;
+            logInfo("IP address blocked and added to blocked_ips.json: " + ipAddress);
+        } else {
+            qWarning() << "Failed to open file for writing: " << file.errorString();
+            logError("Failed to save blocked IP to file: " + ipAddress);
+        }
+    }
+
+    void unblockIPAddress(const QString &ipAddress) {
+        qDebug() << "Unblocking IP address: " << ipAddress;
+        
+        // First try to unblock via DBus if interface is available
+        if (firewallInterface && firewallInterface->isValid()) {
+            QDBusMessage reply = firewallInterface->call("unblockIP", ipAddress);
+            if (reply.type() == QDBusMessage::ReplyMessage) {
+                qDebug() << "IP address unblocked successfully via firewalld:" << ipAddress;
+                logInfo("Unblocked IP address: " + ipAddress);
+                return;
+            }
+        }
+        
+        // Fallback to local file-based unblocking
+        QFile file(QDir::homePath() + "/FirewallManagerLogs/blocked_ips.json");
+        if (!file.exists() || !file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            qWarning() << "Blocked IPs file doesn't exist or can't be opened";
+            return;
+        }
+        
+        // Read the existing JSON data from the file
+        QByteArray fileData = file.readAll();
+        file.close();
+        
+        QJsonDocument doc = QJsonDocument::fromJson(fileData);
+        if (!doc.isObject()) {
+            qWarning() << "Invalid JSON format in blocked IPs file";
+            return;
+        }
+        
+        QJsonObject obj = doc.object();
+        QJsonArray blockedArray = obj["blocked_ips"].toArray();
+        
+        // Create a new array without the IP to unblock
+        QJsonArray newBlockedArray;
+        bool found = false;
+        for (const auto &value : blockedArray) {
+            if (value.toString() != ipAddress) {
+                newBlockedArray.append(value);
+            } else {
+                found = true;
+            }
+        }
+        
+        if (!found) {
+            qDebug() << "IP address was not blocked: " << ipAddress;
+            return;
+        }
+        
+        // Update and save the file
+        obj["blocked_ips"] = newBlockedArray;
+        if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            file.write(QJsonDocument(obj).toJson());
+            file.close();
+            qDebug() << "Unblocked IP: " << ipAddress;
+            logInfo("IP address unblocked: " + ipAddress);
+        } else {
+            qWarning() << "Failed to open file for writing: " << file.errorString();
+            logError("Failed to update blocked IPs file when unblocking: " + ipAddress);
+        }
+    }
+
+    void getGeoIP(const QString &ip) {
+        if (!networkManager) {
+            networkManager = new QNetworkAccessManager(this);
+        }
+        
+        QUrl url(QString("http://ip-api.com/json/%1").arg(ip));
+        QNetworkRequest request(url);
+        QNetworkReply *reply = networkManager->get(request);
+        
+        connect(reply, &QNetworkReply::finished, this, [this, reply, ip]() {
+            if (reply->error() != QNetworkReply::NoError) {
+                logError("Error fetching geolocation data: " + reply->errorString());
+                reply->deleteLater();
+                return;
+            }
+            
+            QByteArray data = reply->readAll();
+            QJsonDocument jsonDoc = QJsonDocument::fromJson(data);
+            
+            // Check if JSON is valid
+            if (!jsonDoc.isObject()) {
+                logWarning("Invalid JSON format received in geolocation data");
+                reply->deleteLater();
+                return;
+            }
+            
+            QJsonObject jsonObject = jsonDoc.object();
+            
+            // Extract data
+            QString country = jsonObject["country"].toString();
+            QString city = jsonObject["city"].toString();
+            QString region = jsonObject["regionName"].toString();
+            QString isp = jsonObject["isp"].toString();
+            QString status = jsonObject["status"].toString();
+            
+            if (status == "fail") {
+                logWarning("Failed to get geolocation for IP: " + ip);
+                reply->deleteLater();
+                return;
+            }
+            
+            // Log the information
+            QString geoInfo = QString("IP: %1, Country: %2, Region: %3, City: %4, ISP: %5")
+                .arg(ip).arg(country).arg(region).arg(city).arg(isp);
+            logInfo("GeoIP information: " + geoInfo);
+            
+            // Optionally check for blocked countries
+            QStringList blockedCountries = {"North Korea", "SomeOtherBlockedCountry"};
+            if (blockedCountries.contains(country)) {
+                logWarning("IP from blocked country detected: " + country + " - " + ip);
+                blockIPAddress(ip);
+            }
+            
+            reply->deleteLater();
+        });
+    }
+
+    QMap<QString, int> analyzeTraffic() {
+        QMap<QString, int> trafficStats;
+        
+        // Process all active connections to gather statistics
+        for (auto it = connectionTable.begin(); it != connectionTable.end(); ++it) {
+            // Increment packet count for this source IP
+            QString sourceIP = it.value().sourceIP;
+            if (trafficStats.contains(sourceIP)) {
+                trafficStats[sourceIP] += it.value().packetCount;
+            } else {
+                trafficStats[sourceIP] = it.value().packetCount;
+            }
+        }
+        
+        // Look for suspicious patterns
+        QStringList suspiciousIPs;
+        for (auto it = trafficStats.begin(); it != trafficStats.end(); ++it) {
+            // Example threshold: 1000 packets from a single IP
+            if (it.value() > 1000) {
+                suspiciousIPs.append(it.key());
+                logWarning("Suspicious traffic detected from IP: " + it.key() + 
+                           " with " + QString::number(it.value()) + " packets");
+            }
+        }
+        
+        // Return the collected traffic statistics
+        return trafficStats;
+    }
+
+    bool loadConfig() {
+        QString configPath = QDir::homePath() + "/FirewallManagerConfig/config.txt";
+        QMap<QString, QString> config = ::loadConfig(configPath); // Use global loadConfig function
+        
+        if (config.isEmpty()) {
+            logWarning("No configuration found or empty configuration file");
+            
+            // Create default configuration
+            config["enableLogging"] = "true";
+            config["logLevel"] = "INFO";
+            config["checkInterval"] = "60"; // seconds
+            config["vpnPath"] = "";
+            config["allowedPorts"] = "80,443,22,53";
+            config["blockedCountries"] = "North Korea";
+            
+            // Create directory if it doesn't exist
+            QDir configDir = QFileInfo(configPath).dir();
+            if (!configDir.exists()) {
+                configDir.mkpath(".");
+            }
+            
+            // Save default configuration
+            QFile configFile(configPath);
+            if (configFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                QTextStream out(&configFile);
+                for (auto it = config.begin(); it != config.end(); ++it) {
+                    out << it.key() << "=" << it.value() << "\n";
+                }
+                configFile.close();
+                logInfo("Created default configuration file");
+            } else {
+                logError("Failed to create default configuration file");
+                return false;
+            }
+        }
+        
+        // Apply the configuration settings
+        // Log level
+        QString logLevel = config.value("logLevel", "INFO");
+        // Check interval
+        bool ok = false;
+        int checkInterval = config.value("checkInterval", "60").toInt(&ok);
+        if (!ok || checkInterval < 10) {
+            checkInterval = 60; // Default to 60 seconds if invalid
+        }
+        
+        // Process allowed ports
+        QStringList allowedPorts = config.value("allowedPorts", "").split(",", Qt::SkipEmptyParts);
+        for (const QString &port : allowedPorts) {
+            logInfo("Adding allowed port: " + port);
+            // You would call your addPort method here if needed
+        }
+        
+        logInfo("Configuration loaded successfully");
+        return true;
+    }
+
+    void sendNotification(const QString &title, const QString &message) {
+        // Check the platform and use appropriate notification method
+        #if defined(Q_OS_LINUX)
+            // For Linux, use notify-send
+            QProcess process;
+            QStringList args;
+            args << title << message;
+            process.start("notify-send", args);
+            process.waitForFinished(3000); // Wait up to 3 seconds
+            
+            if (process.exitCode() != 0) {
+                logWarning("Failed to send notification via notify-send: " + 
+                           process.readAllStandardError());
+            }
+        #elif defined(Q_OS_WIN)
+            // For Windows, could use Windows notification API
+            // This is just a placeholder - you would need to implement Windows notifications
+            logInfo("Notification on Windows - Title: " + title + ", Message: " + message);
+            // For a real implementation, you might use QSystemTrayIcon or Windows API
+        #elif defined(Q_OS_MACOS)
+            // For macOS, could use NSUserNotification
+            // This is just a placeholder
+            logInfo("Notification on macOS - Title: " + title + ", Message: " + message);
+        #else
+            // Fallback - just log the notification
+            logInfo("Notification - Title: " + title + ", Message: " + message);
+        #endif
+        
+        // Also log the notification
+        logInfo("Notification sent - " + title + ": " + message);
+    }
+
+    void sendNotification(const QString &message) {
+        sendNotification("Firewall Alert", message);
+    }
+
 signals:
     void internetStatusChanged(bool status);
 };
 
+bool FirewallManager::isInternetConnected() {
+    // Return the last known internet status
+    return internetStatus;
+}
 
-    void callFirewallRule(const QString& method, const QString& action, const QString& direction, const QString& protocol) {
-        QDBusMessage reply = firewallInterface->call(method, action, direction, "all", protocol);
-    
-        if (reply.type() == QDBusMessage::ReplyMessage) {
-            qDebug() << QString("Successfully %1 %2 ICMP traffic for %3.")
-                            .arg((method.contains("add", Qt::CaseInsensitive) ? "blocked" : "unblocked"))
+void callFirewallRule(const QString& method, const QString& action, const QString& direction, const QString& protocol) {
+    QDBusMessage reply = firewallInterface->call(method, action, direction, "all", protocol);
+
+    if (reply.type() == QDBusMessage::ReplyMessage) {
+        qDebug() << QString("Successfully %1 %2 ICMP traffic for %3.")
+                        .arg((method.contains("add", Qt::CaseInsensitive) ? "blocked" : "unblocked"))
+                        .arg(protocol.toUpper())
+                        .arg(direction);
+    } else {
+        qCritical() << QString("Error: Unable to %1 %2 ICMP traffic for %3.")
+                            .arg((method.contains("add", Qt::CaseInsensitive) ? "block" : "unblock"))
                             .arg(protocol.toUpper())
                             .arg(direction);
-        } else {
-            qCritical() << QString("Error: Unable to %1 %2 ICMP traffic for %3.")
-                                .arg((method.contains("add", Qt::CaseInsensitive) ? "block" : "unblock"))
-                                .arg(protocol.toUpper())
-                                .arg(direction);
-        }
     }
-    
+}
 
 void blockICMP() {
     // Block ICMP for both incoming and outgoing directions
@@ -807,7 +1136,7 @@ void blockIPAddress(const QString &ipAddress) {
     
         process->start();
         
-        if (!process.waitForStarted(5000)) { // Timeout after 5 seconds
+        if (!process->waitForStarted(5000)) { // Timeout after 5 seconds
             qWarning() << "Failed to start command: " << command;
             process->deleteLater();
             return;
@@ -1218,10 +1547,10 @@ void removeInterface(const QString &zone, const QString &interface) {
         if (packetSize > averageSize * packetThreshold) {
             qWarning() << "Anomaly detected: Packet size " << packetSize;
             
-            blockWebsite(connection.SourceIP);
+            blockWebsite(connection.sourceIP);
 
             // Send notification
-            QProcess::execute("notify-send", QStringList() << "Anomaly detected: Large packet size from IP " + connection.SourceIP);
+            QProcess::execute("notify-send", QStringList() << "Anomaly detected: Large packet size from IP " + connection.sourceIP);
         }
     }
 
@@ -1671,7 +2000,7 @@ void removeInterface(const QString &zone, const QString &interface) {
 
 
     int main(int argc, char *argv[]) {
-    system("figlet 'YUNA'");
+    displayBanner();
 
     QCoreApplication app(argc, argv);
     QCommandLineParser parser;
@@ -1762,6 +2091,8 @@ void removeInterface(const QString &zone, const QString &interface) {
     return app.exec();
 }
 
+#include "moc_YUNA.cpp"
+
 // This is a firewall management application that uses D-Bus to communicate with the firewalld service
 // It includes AI-based threat detection using a neural network
 
@@ -1850,3 +2181,4 @@ void removeInterface(const QString &zone, const QString &interface) {
 // Initializes the FirewallManager
 // Sets up periodic timers for threat monitoring, maintenance, and training
 // ...existing code...
+

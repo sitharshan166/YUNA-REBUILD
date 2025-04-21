@@ -3,8 +3,10 @@ CONFIG += c++14
 TARGET = YUNA
 TEMPLATE = app
 
+# Source files
 SOURCES += YUNA.cpp
 
+# Header files
 HEADERS += firewallInterface.h
 
 # Default rules for deployment.
@@ -15,6 +17,5 @@ else: unix:!android: target.path = /opt/$${TARGET}/bin
 # Ensure proper build environment
 CONFIG += console
 CONFIG -= app_bundle
-
-# Add this line to ensure proper MOC processing
 CONFIG += no_keywords
+CONFIG += qt
