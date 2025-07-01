@@ -1731,7 +1731,6 @@ void removeInterface(const QString &zone, const QString &interface) {
         }
     }
 
-    /// /
 
     void trainNeuralNetwork() {
         if (trainingData.size() > 100) {  // Train after collecting enough samples
@@ -1996,15 +1995,278 @@ void removeInterface(const QString &zone, const QString &interface) {
         // Example: Remove duplicate or redundant rules
         // Call D-Bus or internal logic to clean and compact rules
         qDebug() << "Firewall rules optimized.";
-    }    
+    }
 
+    enum OperationMode {
+        FIREWALL_MODE,
+        OTA_MODE,
+    }
+    
+    void runMode(OperationMode mode,FirewallManager &FirewallManager){
+        switch (mode){
+            case FIREWALL_MODE:
+            firewallManager.optimizeFirewallRules();
+            break;
+            case OTA_MODE:
+              verifyOTAUpdate(QByteArray(), QByteArray());
+            break;
+        default:
+            qDebug() << "Unknown mode!";
+            break;
+    }
+}
 
-    int main(int argc, char *argv[]) {
+    // OTA -FUNCTION ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    bool verifyOTAUpdate(const QByteArray &UpdatePackage, const QByteArray &Signature) {
+        // Load manufacturer's public key
+        QFile KeyFile("path/to/public_key.pem");
+        if (!KeyFile.open(QIODevice::ReadOnly)) {
+            qCritical() << "Error: Unable to open public key file.";
+            return false;
+        }
+    
+        QByteArray publicKeyData = KeyFile.readAll();
+        KeyFile.close();
+    
+        // Use OpenSSL to verify the signature
+        EVP_PKEY *pubKey = nullptr;
+        BIO *bio = BIO_new_mem_buf(publicKeyData.data(), publicKeyData.size());
+        pubKey = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
+        BIO_free(bio);
+    
+        if (!pubKey) {
+            qCritical() << "Error: Unable to load public key.";
+            return false;
+        }
+    
+        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+        bool result = false;
+    
+        do {
+            if (!EVP_DigestVerifyInit(ctx, nullptr, EVP_sha256(), nullptr, pubKey)) {
+                qCritical() << "Error: Unable to initialize verification context.";
+                break;
+            }
+    
+            if (!EVP_DigestVerifyUpdate(ctx, UpdatePackage.data(), UpdatePackage.size())) {
+                qCritical() << "Error: Unable to update verification context.";
+                break;
+            }
+    
+            int verifyResult = EVP_DigestVerifyFinal(ctx,
+                                                     (const unsigned char *)Signature.data(),
+                                                     Signature.size());
+    
+            if (verifyResult == 1) {
+                result = true;
+                QString hashValue = QCryptographicHash::hash(UpdatePackage, QCryptographicHash::Sha256).toHex();
+                qDebug() << "✅ Signature verified successfully.";
+                qDebug() << "Hash value of the update package:" << hashValue;
+            } else if (verifyResult == 0) {
+                qCritical() << "❌ Signature verification failed: Invalid signature.";
+            } else {
+                qCritical() << "❌ Signature verification error.";
+            }
+    
+        } while (false);
+    
+        // Clean up resources
+        EVP_MD_CTX_free(ctx);
+        EVP_PKEY_free(pubKey);
+    
+        return result;
+    }
+    
+
+    void manageOTATraffic(const QString &updateServerIP){
+        // ensure firewallInterface is initialized
+        if (!firewallInterface) {
+            qCritical() << "Firewall interface is not initialized.";
+            return;
+        }
+
+        QDBusMessage reply = FirewallInterface->call("addQoSRule", updateServerIP, "periority_high");
+        if (reply.type() == QDBusMessage::ReplyMessage) {
+            qDebug() << "QoS rule added for OTA traffic from" << updateServerIP;
+        } else {
+            qCritical() << "Error: Unable to add QoS rule for OTA traffic."
+                        << reply.errorMessage();
+        }
+    }
+
+    void setupECUFirewallZones() {
+    // Ensure firewallInterface is initialized
+    if (!firewallInterface) {
+        qCritical() << "Firewall interface is not initialized.";
+        return;
+    }
+
+    // Create high-security zone for critical ECUs (e.g., engine control, braking)
+    QDBusMessage reply1 = firewallInterface->call("addZone", "critical_ecu", "highest");
+    if (reply1.type() == QDBusMessage::ReplyMessage) {
+        qDebug() << "Zone 'critical_ecu' created with highest security.";
+    } else {
+        qCritical() << "Error: Unable to create 'critical_ecu' zone -" << reply1.errorMessage();
+    }
+
+    // Create low-security zone for infotainment ECUs
+    QDBusMessage reply2 = firewallInterface->call("addZone", "infotainment_ecu", "low");
+    if (reply2.type() == QDBusMessage::ReplyMessage) {
+        qDebug() << "Zone 'infotainment_ecu' created with low security.";
+    } else {
+        qCritical() << "Error: Unable to create 'infotainment_ecu' zone -" << reply2.errorMessage();
+    }
+
+    // Restrict communication from infotainment to critical ECUs
+    QDBusMessage reply3 = firewallInterface->call(
+        "add", "deny", "in", "infotainment_ecu", "critical_ecu", "all"
+    );
+    if (reply3.type() == QDBusMessage::ReplyMessage) {
+        qDebug() << "Restricted communication from 'infotainment_ecu' to 'critical_ecu'.";
+    } else {
+        qCritical() << "Error: Unable to restrict communication -" << reply3.errorMessage();
+    }
+}
+
+    void monitorECUBehavior(const QString &ecuID, const NetworkFeatures &features) {
+        // Extract features from ECU communications
+        std::vector<double> inputVector = convertToVector(features);
+        
+        // Use neural network to detect anomalies
+        neuralNetwork->forwardPropagate(inputVector);
+        double anomalyScore = neuralNetwork->outputLayer[0][0];
+        
+        // Take action if suspicious activity detected
+        if (anomalyScore > 0.75) {
+            qWarning() << "Anomaly detected for ECU:" << ecuID << " (score:" << anomalyScore << ")";
+            isolateECU(ecuID);
+            sendNotification("Anomaly detected in ECU: " + ecuID);
+        } else {
+             qDebug() << "ECU" << ecuID << "behavior normal (score:" << anomalyScore << ")";
+        }
+    }
+
+   void verifyECUHealth(const QString &ecuIP) {
+        qdebug()<< "verifying health of ECU at IP:" << ecuIP;
+        // Example: Use QProcess to ping the ECU as a basic health check
+        QProcess process;
+        process.start("ping", QStringList() << "-c" << "1" << ecuIP);
+        if (!process.waitForFinished(3000)) {
+            qWarning() << "Timeout while checking ECU health at IP:" << ecuIP;
+            isolateECU(getECUIdFromIP(ecuIP)); // Isolate ECU if health check fails
+            return;
+        }
+        QString output = process.readAllStandardOutput();
+        "100% packet loss") || process.exitCode() != 0) {
+        qWarning() << "ECU" << ecuIP << "is unresponsive or unhealthy.";
+        isolateECU(getECUIdFromIP(ecuIP));
+    } else {
+        qDebug() << "ECU" << ecuIP << "is healthy.";
+    }
+}
+    
+ 
+   void scheduleSecureOTAWindow(const QDateTime &updateTime, int durationMinutes) {
+    // Calculate the start and end times for the OTA update window
+    QDateTime endTime = updateTime.addSecs(durationMinutes * 60);
+
+    // Schedule the start of the OTA window
+    int msToStart = QDateTime::currentDateTime().msecsTo(updateTime);
+    if (msToStart < 0) {
+        qWarning() << "OTA window start time is in the past.";
+        return;
+    }
+
+    // Timer to start OTA window
+    QTimer::singleShot(msToStart, [=]() {
+        qDebug() << "Starting secure OTA window at" << updateTime.toString(Qt::ISODate);
+
+        // Example: Open only OTA-related ports and restrict all others
+        // (Assume firewallInterface is initialized and available globally or via singleton)
+        if (firewallInterface) {
+            // Allow OTA port (e.g., 443/tcp for HTTPS)
+            QDBusMessage allowOta = firewallInterface->call("addPort", "443", "tcp");
+            if (allowOta.type() == QDBusMessage::ReplyMessage) {
+                qDebug() << "OTA port 443/tcp allowed for update window.";
+            } else {
+                qWarning() << "Failed to allow OTA port for update window.";
+            }
+            // Optionally, block other sensitive ports here
+        }
+
+        // Notify user/admin
+        sendNotification("OTA Update Window Started", 
+                         QString("OTA update window is now open for %1 minutes.").arg(durationMinutes));
+    });
+
+    // Timer to end OTA window and restore normal security
+    int msToEnd = QDateTime::currentDateTime().msecsTo(endTime);
+    QTimer::singleShot(msToEnd, [=]() {
+        qDebug() << "Ending secure OTA window at" << endTime.toString(Qt::ISODate);
+
+        // Restore normal firewall rules
+        if (firewallInterface) {
+            // Remove OTA port rule
+            QDBusMessage removeOta = firewallInterface->call("removePort", "443", "tcp");
+            if (removeOta.type() == QDBusMessage::ReplyMessage) {
+                qDebug() << "OTA port 443/tcp closed after update window.";
+            } else {
+                qWarning() << "Failed to close OTA port after update window.";
+            }
+            // Optionally, restore other rules here
+        }
+
+        // Notify user/admin
+        sendNotification("OTA Update Window Ended", 
+                         "OTA update window closed. Security rules restored.");
+    });
+
+    qDebug() << "OTA update window scheduled from" << updateTime.toString(Qt::ISODate)
+             << "to" << endTime.toString(Qt::ISODate);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////
+  void sendTelemetryToFleetManager(const QString &eventType, const QVariantMap &data) {
+    // Format telemetry data with vehicle ID, timestamp, and event details
+    QVariantMap telemetry;
+    telemetry["vehicle_id"] = "YUNA-001"; // Replace with actual vehicle ID if available
+    telemetry["event_type"] = eventType;
+    telemetry["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+    telemetry["data"] = data;
+
+    // Convert to JSON
+    QJsonDocument doc = QJsonDocument::fromVariant(telemetry);
+    QByteArray jsonData = doc.toJson();
+
+    // (Optional) Encrypt the data for secure transmission
+    // For demonstration, this step is omitted. In production, use a crypto library.
+
+    // Send to fleet management server (example URL)
+    QUrl url("https://fleet.example.com/api/telemetry");
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+
+    // Use a QNetworkAccessManager instance (assume 'networkManager' is available)
+    QNetworkReply *reply = networkManager->post(request, jsonData);
+
+    // Handle the reply asynchronously
+    connect(reply, &QNetworkReply::finished, [reply]() {
+        if (reply->error() == QNetworkReply::NoError) {
+            qDebug() << "Telemetry sent successfully to fleet manager.";
+        } else {
+            qWarning() << "Failed to send telemetry:" << reply->errorString();
+        }
+        reply->deleteLater();
+    });
+}
+///////////////////////////////////////////////////////////////////////////////////.
+
+ int main(int argc, char *argv[]) {
     displayBanner();
 
     QCoreApplication app(argc, argv);
     QCommandLineParser parser;
-    parser.setApplicationDescription("Manage Firewall Rules using D-Bus");
+    parser.setApplicationDescription("Manage Firewall Rules using D-Bus and OTA");
     parser.addHelpOption();
     parser.addVersionOption();
 
@@ -2024,6 +2286,9 @@ void removeInterface(const QString &zone, const QString &interface) {
     QCommandLineOption addPortProtocolOption("protocol", "Protocol for the port (tcp/udp)", "protocol");
     QCommandLineOption removePortOption("remove-port", "Remove a port from the firewall", "port");
     QCommandLineOption removePortProtocolOption("remove-protocol", "Protocol for the port to remove (tcp/udp)", "protocol");
+    QCommandLineOption scheduleOTAOption("schedule-ota", "Schedule a secure OTA update window (ISO datetime)", "datetime");
+    QCommandLineOption otaDurationOption("ota-duration", "Duration of OTA window in minutes", "minutes");
+    QCommandLineOption verifyOTAOption("verify-ota", "Verify an OTA update package (package path, signature path)", "package,signature");
 
     parser.addOption(restoreDefaultOption);
     parser.addOption(blockWebsiteOption);
@@ -2031,6 +2296,9 @@ void removeInterface(const QString &zone, const QString &interface) {
     parser.addOption(addPortProtocolOption);
     parser.addOption(removePortOption);
     parser.addOption(removePortProtocolOption);
+    parser.addOption(scheduleOTAOption);
+    parser.addOption(otaDurationOption);
+    parser.addOption(verifyOTAOption);
     parser.process(app);
 
     if (parser.isSet(restoreDefaultOption)) {
@@ -2065,6 +2333,45 @@ void removeInterface(const QString &zone, const QString &interface) {
         QString protocol = parser.positionalArguments().at(1);
         firewallManager.addPort(port, protocol);
     }
+
+    // New: Schedule secure OTA window if requested
+    if (parser.isSet(scheduleOTAOption)) {
+        QString datetimeStr = parser.value(scheduleOTAOption);
+        int duration = parser.value(otaDurationOption).toInt();
+        QDateTime updateTime = QDateTime::fromString(datetimeStr, Qt::ISODate);
+        if (!updateTime.isValid() || duration <= 0) {
+            qCritical() << "Error: Invalid OTA window time or duration.";
+            return 1;
+        }
+        scheduleSecureOTAWindow(updateTime, duration);
+    }
+
+    // New: Verify OTA update package if requested
+    if (parser.isSet(verifyOTAOption)) {
+        QStringList args = parser.value(verifyOTAOption).split(",");
+        if (args.size() != 2) {
+            qCritical() << "Error: Please provide both package and signature file paths.";
+            return 1;
+        }
+        QFile packageFile(args[0]);
+        QFile signatureFile(args[1]);
+        if (!packageFile.open(QIODevice::ReadOnly) || !signatureFile.open(QIODevice::ReadOnly)) {
+            qCritical() << "Error: Unable to open OTA package or signature file.";
+            return 1;
+        }
+        QByteArray packageData = packageFile.readAll();
+        QByteArray signatureData = signatureFile.readAll();
+        packageFile.close();
+        signatureFile.close();
+        bool verified = verifyOTAUpdate(packageData, signatureData);
+        if (verified) {
+            qDebug() << "OTA update package verified successfully.";
+        } else {
+            qCritical() << "OTA update package verification failed.";
+            return 1;
+        }
+    }
+
     // Schedule threat checks
     QTimer threatMonitorTimer;
     QObject::connect(&threatMonitorTimer, &QTimer::timeout, [&firewallManager]() {
@@ -2093,92 +2400,4 @@ void removeInterface(const QString &zone, const QString &interface) {
 
 #include "moc_YUNA.cpp"
 
-// This is a firewall management application that uses D-Bus to communicate with the firewalld service
-// It includes AI-based threat detection using a neural network
-
-// Include statements for various Qt and standard libraries
-// ...existing code...
-
-// Logger class for logging messages to a file
-// ...existing code...
-
-// NeuralNetwork class for AI-based threat detection
-// Takes inputs like packet rate, packet size, connection duration, and port numbers
-// Uses forward propagation to analyze network traffic patterns
-// Can be trained to recognize and detect anomalous traffic behavior
-// ...existing code...
-
-// Data structures to store network and connection information
-// NetworkFeatures: Tracks metrics like packet rate, size, duration, and port number
-// ConnectionState: Tracks connection details including IP addresses, ports, and traffic stats
-// NetworkTrafficData: Simple structure for storing traffic analysis data
-// ...existing code...
-
-// FirewallManager class (forward declaration)
-// Main class responsible for managing firewall rules and monitoring network traffic
-// ...existing code...
-
-// getHelpInformation function
-// Returns a detailed help text with all available commands and their descriptions
-// ...existing code...
-
-// FirewallManager class implementation
-// Manages firewall rules through D-Bus interface
-// Includes methods for:
-//   - Initializing and training the neural network for threat detection
-//   - Analyzing network traffic features and converting them to vectors for the neural network
-//   - Logging events at different severity levels
-//   - Adding and removing NAT rules
-//   - Checking internet connectivity
-//   - Managing VPN connections (connect, disconnect, check status)
-//   - Implementing panic mode to quickly block all traffic in emergencies
-//   - Blocking/unblocking specific IP addresses
-//   - Getting geographical information for IP addresses to support geo-blocking
-//   - Managing connection state and cleaning up expired connections
-//   - Self-healing mechanisms to respond to threats
-//   - Scheduling maintenance tasks
-// ...existing code...
-
-// Firewall rule management functions
-// Adding, removing, and modifying firewall rules through D-Bus calls
-// Functions for blocking/unblocking ICMP traffic
-// Functions for configuring NAT (Network Address Translation)
-// ...existing code...
-
-// IP and website blocking functions
-// blockIPAddress: Adds an IP to a JSON list of blocked IPs
-// getGeoIP: Retrieves geographical information for an IP address
-// blockWebsite: Resolves a domain name and blocks all associated IP addresses
-// ...existing code...
-
-// Traffic analysis functions
-// analysisTrafficForAnomalies: Detects unusual numbers of connections from an IP
-// detectPacketSizeAnomaly: Identifies packets that are suspiciously large
-// ...existing code...
-
-// Neural network training and threat detection
-// trainNeuralNetwork: Trains the neural network with collected traffic data
-// detectThreat: Analyzes traffic patterns to identify potential threats
-// respondToThreat: Takes action when a threat is detected
-// ...existing code...
-
-// System maintenance and configuration functions
-// restoreDefaultConfig: Resets firewall to default settings
-// cleanupExpiredConnections: Removes old connections and uses their data for training
-// optimizeFirewallRules: Improves firewall rule organization and efficiency
-// checkFirewallHealth: Verifies the firewall service is running correctly
-// ...existing code...
-
-// User notification functions
-// sendNotification: Sends desktop notifications about important events
-// ruleViolationDetected: Alerts when firewall rules are violated
-// logAndNotify: Combines logging and notification into one step
-// ...existing code...
-
-// Main function
-// Sets up the application, processes command line arguments
-// Establishes D-Bus connection
-// Initializes the FirewallManager
-// Sets up periodic timers for threat monitoring, maintenance, and training
-// ...existing code...
 

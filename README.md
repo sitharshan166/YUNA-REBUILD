@@ -98,6 +98,3 @@ The project uses Qt with D-Bus for firewall management and contains a neural net
 - `YUNA.pro`: Qt project file for building with qmake
 - `firewallInterface.h`: D-Bus interface for firewall operations
 
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
